@@ -447,22 +447,31 @@ namespace
 	}
 
 	// The first line of /data/rpcs3/boot.txt: an EBOOT.BIN, a game folder, an ISO, or a .pkg to install
+	// Blazing: a per-game home-screen tile ships /app0/boot.txt (its own game); it wins over /data/rpcs3/boot.txt
 	std::string read_boot_target()
 	{
-		const std::string boot_file = std::string(data_dir) + "boot.txt";
-		fs::file f(boot_file);
-		if (!f)
+		for (const std::string boot_file : { std::string("/app0/boot.txt"), std::string(data_dir) + "boot.txt" })
 		{
-			return {};
+			fs::file f(boot_file);
+			if (!f)
+			{
+				continue;
+			}
+
+			std::string text = f.to_string();
+			if (const usz end = text.find_first_of("\r\n"); end != umax)
+			{
+				text.resize(end);
+			}
+
+			if (!text.empty())
+			{
+				sys_log.notice("Boot target from %s: %s", boot_file, text);
+				return text;
+			}
 		}
 
-		std::string text = f.to_string();
-		if (const usz end = text.find_first_of("\r\n"); end != umax)
-		{
-			text.resize(end);
-		}
-
-		return text;
+		return {};
 	}
 
 	// Copies a folder's files and subfolders (resources the title ships beside its eboot)
@@ -613,6 +622,16 @@ int main(int /*argc*/, char** /*argv*/)
 	sys_log.always()("%s", rpcs3::get_verbose_version());
 	sys_log.notice("Running as a native PS5 title; data in %s", data_dir);
 	sys_log.notice("%s", utils::get_system_info());
+
+	// Blazing (PS5 port playbook #1): RADV's disk shader cache in a folder the title can write, so
+	// compiled shaders survive between starts (a read-only /app0 image turns the cache off)
+	if (!::getenv("MESA_SHADER_CACHE_DIR"))
+	{
+		const std::string radv_cache = std::string(data_dir) + "cache/radv-shader-cache";
+		fs::create_path(radv_cache);
+		::setenv("MESA_SHADER_CACHE_DIR", radv_cache.c_str(), 1);
+		sys_log.notice("MESA_SHADER_CACHE_DIR=%s", radv_cache);
+	}
 
 	// Vulkan's global commands from RADV, before anything creates an instance
 	volkInitializeCustom(vk_icdGetInstanceProcAddr);
