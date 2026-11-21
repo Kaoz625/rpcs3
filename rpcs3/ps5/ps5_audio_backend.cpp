@@ -2,6 +2,9 @@
 #include "ps5_audio_backend.h"
 #include "ps5_sce.h"
 
+#include <chrono>
+#include <cmath>
+
 LOG_CHANNEL(ps5_audio_log, "SceAudioOut");
 
 ps5_audio_backend::ps5_audio_backend()
@@ -111,8 +114,49 @@ void ps5_audio_backend::output_loop()
 		// Silence for what the callback did not fill
 		std::memset(m_buffer.data() + written, 0, bytes - written);
 
-		// Blocks until the port takes the grain
-		sceAudioOutOutput(m_port, m_buffer.data());
+		// BLZ: proof that sound really plays - level of what goes to the port, every 5 s
+		{
+			using clk = std::chrono::steady_clock;
+			static thread_local clk::time_point lvl_start = clk::now();
+			static thread_local double lvl_sq = 0.0, lvl_peak = 0.0;
+			static thread_local u64 lvl_samples = 0, lvl_bytes = 0, lvl_filled = 0, lvl_grains = 0, lvl_errors = 0;
+			if (get_convert_to_s16())
+			{
+				const s16* smp = reinterpret_cast<const s16*>(m_buffer.data());
+				for (u32 i = 0; i < written / 2; i++)
+				{
+					const double v = smp[i] / 32768.0;
+					lvl_sq += v * v;
+					lvl_peak = std::max(lvl_peak, std::fabs(v));
+				}
+				lvl_samples += written / 2;
+			}
+			else
+			{
+				const f32* smp = reinterpret_cast<const f32*>(m_buffer.data());
+				for (u32 i = 0; i < written / 4; i++)
+				{
+					const double v = smp[i];
+					lvl_sq += v * v;
+					lvl_peak = std::max(lvl_peak, std::fabs(v));
+				}
+				lvl_samples += written / 4;
+			}
+			lvl_bytes += bytes;
+			lvl_filled += written;
+			lvl_grains++;
+			const int res = sceAudioOutOutput(m_port, m_buffer.data());
+			if (res < 0) lvl_errors++;
+			const auto now = clk::now();
+			if (now - lvl_start >= std::chrono::seconds(5))
+			{
+				const double rms = lvl_samples ? std::sqrt(lvl_sq / lvl_samples) : 0.0;
+				ps5_audio_log.notice("BLZ_AUDIO: rms_dbfs=%.1f peak=%.3f filled=%.0f%% grains=%llu out_errors=%llu",
+					rms > 0 ? 20.0 * std::log10(rms) : -999.0, lvl_peak, lvl_bytes ? 100.0 * lvl_filled / lvl_bytes : 0.0,
+					lvl_grains, lvl_errors);
+				lvl_start = now; lvl_sq = 0; lvl_peak = 0; lvl_samples = lvl_bytes = lvl_filled = lvl_grains = lvl_errors = 0;
+			}
+		}
 	}
 
 	// Flush: an output of null waits for the port to drain
