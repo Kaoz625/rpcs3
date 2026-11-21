@@ -25,6 +25,7 @@
 
 #include "util/asm.hpp"
 #include <vulkan/vulkan_core.h>
+#include <chrono>
 
 namespace vk
 {
@@ -1913,6 +1914,7 @@ bool VKGSRender::load_program()
 		}
 
 		// Load current program from cache
+		const auto program_begin = std::chrono::steady_clock::now();
 		std::tie(m_program, m_vertex_prog, m_fragment_prog) = m_prog_buffer->get_graphics_pipeline(
 			&m_program_cache_hint,
 			vertex_program,
@@ -1921,6 +1923,14 @@ bool VKGSRender::load_program()
 			shadermode != shader_mode::recompiler, true);
 
 		vk::leave_uninterruptible();
+
+		const auto program_us = std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now() - program_begin).count();
+		if (program_us >= 8'000)
+		{
+			rsx_log.notice("RECOMPILER_SHADER_WAIT: path=program_lookup us=%lld ready=%u renderpass=0x%llx",
+				static_cast<s64>(program_us), static_cast<u32>(m_program != nullptr), m_pipeline_properties.renderpass_key);
+		}
 
 		if (m_prog_buffer->check_cache_missed())
 		{

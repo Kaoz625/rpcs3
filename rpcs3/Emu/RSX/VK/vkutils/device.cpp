@@ -1,4 +1,5 @@
 #include "device.h"
+#include "../recompiler_dynamic_pipeline.h"
 #include "instance.h"
 #include "util/logs.hpp"
 #include "Emu/system_config.h"
@@ -719,6 +720,32 @@ namespace vk
 			enabled_features.logicOp = VK_FALSE;
 		}
 
+		// BLZ (Michele-M-Media PS3-TO-PS5 port): extended dynamic state 1+3 lets the shader
+		// interpreter share one pipeline across topology/cull/front/depth-write/blend variants.
+		VkPhysicalDeviceExtendedDynamicStateFeaturesEXT draw_state{
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
+		VkPhysicalDeviceExtendedDynamicState3FeaturesEXT blend_state{
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+		const supported_extensions eds_extensions(supported_extensions::device, nullptr, *pgpu);
+		if (!getenv("BLZ_NO_DYNAMIC_PIPELINE") &&
+			eds_extensions.is_supported(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME) &&
+			eds_extensions.is_supported(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME))
+		{
+			VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+			query.pNext = &draw_state;
+			draw_state.pNext = &blend_state;
+			vkGetPhysicalDeviceFeatures2(*pgpu, &query);
+		}
+		const bool supports_dynamic_pipeline = draw_state.extendedDynamicState &&
+			blend_state.extendedDynamicState3ColorBlendEnable &&
+			blend_state.extendedDynamicState3ColorBlendEquation &&
+			blend_state.extendedDynamicState3ColorWriteMask;
+		if (supports_dynamic_pipeline)
+		{
+			requested_extensions.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
+			requested_extensions.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
+		}
+
 		VkDeviceCreateInfo device = {};
 		device.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 		device.pNext = nullptr;
@@ -841,11 +868,40 @@ namespace vk
 			device.pNext = &provoking_vertex_info;
 		}
 
+		if (supports_dynamic_pipeline)
+		{
+			draw_state = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
+			draw_state.extendedDynamicState = VK_TRUE;
+			blend_state = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+			blend_state.extendedDynamicState3ColorBlendEnable = VK_TRUE;
+			blend_state.extendedDynamicState3ColorBlendEquation = VK_TRUE;
+			blend_state.extendedDynamicState3ColorWriteMask = VK_TRUE;
+			blend_state.pNext = const_cast<void*>(device.pNext);
+			draw_state.pNext = &blend_state;
+			device.pNext = &draw_state;
+		}
+
 		if (auto error = vkCreateDevice(*pgpu, &device, nullptr, &dev))
 		{
 			dump_debug_info(requested_extensions, enabled_features);
 			vk::die_with_error(error);
 		}
+
+		if (supports_dynamic_pipeline)
+		{
+			auto& functions = recompiler_dynamic::draw_commands;
+			functions.device = dev;
+			functions.topology = reinterpret_cast<PFN_vkCmdSetPrimitiveTopologyEXT>(vkGetDeviceProcAddr(dev, "vkCmdSetPrimitiveTopologyEXT"));
+			functions.cull = reinterpret_cast<PFN_vkCmdSetCullModeEXT>(vkGetDeviceProcAddr(dev, "vkCmdSetCullModeEXT"));
+			functions.front = reinterpret_cast<PFN_vkCmdSetFrontFaceEXT>(vkGetDeviceProcAddr(dev, "vkCmdSetFrontFaceEXT"));
+			functions.depth_write = reinterpret_cast<PFN_vkCmdSetDepthWriteEnableEXT>(vkGetDeviceProcAddr(dev, "vkCmdSetDepthWriteEnableEXT"));
+			functions.blend = reinterpret_cast<PFN_vkCmdSetColorBlendEnableEXT>(vkGetDeviceProcAddr(dev, "vkCmdSetColorBlendEnableEXT"));
+			functions.equation = reinterpret_cast<PFN_vkCmdSetColorBlendEquationEXT>(vkGetDeviceProcAddr(dev, "vkCmdSetColorBlendEquationEXT"));
+			functions.mask = reinterpret_cast<PFN_vkCmdSetColorWriteMaskEXT>(vkGetDeviceProcAddr(dev, "vkCmdSetColorWriteMaskEXT"));
+		}
+		rsx_log.notice("RECOMPILER_DYNAMIC_PIPELINE: enabled=%u",
+			static_cast<unsigned>(recompiler_dynamic::draw_commands.device == dev &&
+				static_cast<bool>(recompiler_dynamic::draw_commands)));
 
 		// Dump some diagnostics to the log
 		rsx_log.notice("%u extensions loaded:", ::size32(requested_extensions));
@@ -895,6 +951,8 @@ namespace vk
 				m_allocator.reset();
 			}
 
+			if (recompiler_dynamic::draw_commands.device == dev)
+				recompiler_dynamic::draw_commands = {};
 			vkDestroyDevice(dev, nullptr);
 			dev = nullptr;
 			memory_map = {};

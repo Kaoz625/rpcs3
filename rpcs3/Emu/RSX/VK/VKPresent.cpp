@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "VKGSRender.h"
+#include "recompiler_frame_cadence.h"
 #include "vkutils/buffer_object.h"
 #include "vkutils/memory.h"
 #include "Emu/RSX/Overlays/overlay_manager.h"
@@ -12,11 +13,27 @@
 #include "util/asm.hpp"
 #include "util/video_provider.h"
 
+#include <chrono>
+
 extern atomic_t<bool> g_user_asked_for_screenshot;
 extern atomic_t<recording_mode> g_recording_mode;
 
 namespace
 {
+	using frame_clock = std::chrono::steady_clock;
+	thread_local s64 frame_present_max_us = 0;
+	thread_local recompiler::frame_cadence display_cadence;
+
+	constexpr bool slow_guest_frame(s64 gap_us, s64 acquire_us, s64 queue_us, s64 present_us)
+	{
+		return gap_us >= 50'000 || acquire_us >= 12'000 || queue_us >= 20'000 || present_us >= 12'000;
+	}
+
+	s64 frame_elapsed_us(frame_clock::time_point begin, frame_clock::time_point end)
+	{
+		return std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count();
+	}
+
 	VkFormat RSX_display_format_to_vk_format(u8 format)
 	{
 		switch (format)
@@ -155,7 +172,12 @@ void VKGSRender::present(vk::frame_context_t *ctx)
 
 	if (!swapchain_unavailable)
 	{
-		switch (VkResult error = m_swapchain->present(ctx->present_wait_semaphore, ctx->present_image))
+		const auto present_begin = frame_clock::now();
+		const VkResult error = m_swapchain->present(ctx->present_wait_semaphore, ctx->present_image);
+		frame_present_max_us = std::max(frame_present_max_us, frame_elapsed_us(present_begin, frame_clock::now()));
+		if (!m_swapchain->is_headless())
+			display_cadence.present(error == VK_SUCCESS || error == VK_SUBOPTIMAL_KHR);
+		switch (error)
 		{
 		case VK_SUCCESS:
 			break;
@@ -424,6 +446,24 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
 
 void VKGSRender::flip(const rsx::display_flip_info_t& info)
 {
+	const auto frame_begin = frame_clock::now();
+	const s64 now_us = std::chrono::duration_cast<std::chrono::microseconds>(frame_begin.time_since_epoch()).count();
+	if (const auto window = display_cadence.flip(now_us, info.emu_flip, info.skip_frame))
+	{
+		rsx_log.notice("RECOMPILER_CADENCE: end_us=%lld window_us=%lld guest_flips=%u skipped=%u "
+			"guest_vk_presents=%u other_vk_presents=%u vk_present_errors=%u max_guest_gap_us=%lld",
+			now_us, window->elapsed_us, window->guest_flips, window->skipped, window->guest_presents,
+			window->other_presents, window->failed_presents, window->max_guest_gap_us);
+	}
+	thread_local frame_clock::time_point previous_guest_flip{};
+	thread_local frame_clock::time_point previous_frame_report{};
+	const bool guest_frame = info.emu_flip && !info.skip_frame;
+	const s64 frame_gap_us = guest_frame && previous_guest_flip != frame_clock::time_point{}
+		? frame_elapsed_us(previous_guest_flip, frame_begin) : 0;
+	if (guest_frame)
+		previous_guest_flip = frame_begin;
+	frame_present_max_us = 0;
+
 	// Check swapchain condition/status
 	if (!m_swapchain->supports_automatic_wm_reports())
 	{
@@ -591,6 +631,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 	ensure(m_current_frame->present_image == umax);
 	ensure(m_current_frame->swap_command_buffer == nullptr);
 
+	const auto acquire_begin = frame_clock::now();
 	u64 timeout = m_swapchain->get_swap_image_count() <= 2? 0ull: 100000000ull;
 	while (VkResult status = m_swapchain->acquire_next_swapchain_image(m_current_frame->acquire_signal_semaphore, timeout, &m_current_frame->present_image))
 	{
@@ -631,19 +672,22 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 		}
 	}
 
+	const auto acquire_end = frame_clock::now();
+
 	// Confirm that the driver did not silently fail
 	ensure(m_current_frame->present_image != umax);
 
+	auto present_dims = m_swapchain_dims;
 	// Calculate output dimensions. Done after swapchain acquisition in case it was recreated.
 	areai aspect_ratio;
 	if (!g_cfg.video.stretch_to_display_area)
 	{
-		const auto converted = avconfig.aspect_convert_region({ buffer_width, buffer_height }, m_swapchain_dims);
+		const auto converted = avconfig.aspect_convert_region({ buffer_width, buffer_height }, present_dims);
 		aspect_ratio = static_cast<areai>(converted);
 	}
 	else
 	{
-		aspect_ratio = { 0, 0, s32(m_swapchain_dims.width), s32(m_swapchain_dims.height) };
+		aspect_ratio = { 0, 0, s32(present_dims.width), s32(present_dims.height) };
 	}
 
 	// Blit contents to screen..
@@ -662,7 +706,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 	const bool user_is_recording = (g_recording_mode != recording_mode::stopped && m_frame->can_consume_frame());
 	const bool need_media_capture = user_asked_for_screenshot || user_is_recording;
 
-	const auto render_overlays = [&](vk::framebuffer_holder* fbo, const areau& area)
+	const auto render_overlays = [&](vk::framebuffer_holder* fbo, const areau& area, const areau& display_area)
 	{
 		if (!has_overlay) return;
 
@@ -670,7 +714,6 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 		auto ui_renderer = vk::get_overlay_pass<vk::ui_overlay_renderer>();
 		std::lock_guard lock(*m_overlay_manager);
 
-		const areau display_area = {0, 0, static_cast<u32>(m_swapchain_dims.width), static_cast<u32>(m_swapchain_dims.height)};
 		for (const auto& view : m_overlay_manager->get_views())
 		{
 			const areau render_area = view->use_window_space ? display_area : area;
@@ -742,7 +785,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 
 			vk::framebuffer_holder* sshot_fbo = vk::get_framebuffer(*m_device, buffer_width, buffer_height, VK_FALSE, single_target_pass, { m_overlay_recording_img.get() });
 			sshot_fbo->add_ref();
-			render_overlays(sshot_fbo, areau(rect));
+			render_overlays(sshot_fbo, areau(rect), areau(rect));
 			sshot_fbo->release();
 
 			image_to_copy = m_overlay_recording_img.get();
@@ -848,7 +891,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 			single_target_pass = vk::get_renderpass(*m_device, key);
 			ensure(single_target_pass != VK_NULL_HANDLE);
 
-			direct_fbo = vk::get_framebuffer(*m_device, m_swapchain_dims.width, m_swapchain_dims.height, VK_FALSE, single_target_pass, m_swapchain->get_surface_format(), target_image);
+			direct_fbo = vk::get_framebuffer(*m_device, present_dims.width, present_dims.height, VK_FALSE, single_target_pass, m_swapchain->get_surface_format(), target_image);
 			direct_fbo->add_ref();
 
 			vk::get_overlay_pass<vk::video_out_calibration_pass>()->run(
@@ -904,12 +947,13 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 			single_target_pass = vk::get_renderpass(*m_device, key);
 			ensure(single_target_pass != VK_NULL_HANDLE);
 
-			direct_fbo = vk::get_framebuffer(*m_device, m_swapchain_dims.width, m_swapchain_dims.height, VK_FALSE, single_target_pass, m_swapchain->get_surface_format(), target_image);
+			direct_fbo = vk::get_framebuffer(*m_device, present_dims.width, present_dims.height, VK_FALSE, single_target_pass, m_swapchain->get_surface_format(), target_image);
 		}
 
 		direct_fbo->add_ref();
 
-		render_overlays(direct_fbo, areau(aspect_ratio));
+		const areau display_area = {0, 0, static_cast<u32>(present_dims.width), static_cast<u32>(present_dims.height)};
+		render_overlays(direct_fbo, areau(aspect_ratio), display_area);
 
 		if (g_cfg.video.debug_overlay)
 		{
@@ -972,9 +1016,24 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 		vk::change_image_layout(*m_current_command_buffer, target_image, target_layout, present_layout, subresource_range);
 	}
 
+	const auto queue_begin = frame_clock::now();
 	queue_swap_request();
+	const auto queue_end = frame_clock::now();
 
 	m_frame_stats.flip_time = m_profiler.duration();
+
+	if (guest_frame)
+	{
+		const s64 acquire_us = frame_elapsed_us(acquire_begin, acquire_end);
+		const s64 queue_us = frame_elapsed_us(queue_begin, queue_end);
+		if (slow_guest_frame(frame_gap_us, acquire_us, queue_us, frame_present_max_us) &&
+			(previous_frame_report == frame_clock::time_point{} || frame_elapsed_us(previous_frame_report, queue_end) >= 250'000))
+		{
+			previous_frame_report = queue_end;
+			rsx_log.notice("RECOMPILER_FRAME: gap_us=%lld acquire_us=%lld queue_us=%lld present_max_us=%lld draws=%u buffer=%u",
+				frame_gap_us, acquire_us, queue_us, frame_present_max_us, info.stats.draw_calls, info.buffer);
+		}
+	}
 
 	m_frame->flip(m_context);
 	rsx::thread::flip(info);

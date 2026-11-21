@@ -5,6 +5,7 @@
 
 #include "VKAsyncScheduler.h"
 #include "VKGSRender.h"
+#include "recompiler_dynamic_pipeline.h"
 #include "vkutils/buffer_object.h"
 #include "vkutils/chip_class.h"
 #include <vulkan/vulkan_core.h>
@@ -266,8 +267,13 @@ void VKGSRender::update_draw_state()
 	m_frame_stats.setup_time += m_profiler.duration();
 }
 
+#include "recompiler_texture_retry.h"
+
 void VKGSRender::load_texture_env()
 {
+	// A failed fragment upload yields an empty descriptor that does not expire.
+	static thread_local std::array<recompiler_texture::retry, 16> fragment_retries;
+	static thread_local unsigned retry_messages = 0;
 	// Load textures
 	bool check_for_cyclic_refs = false;
 	auto check_surface_cache_sampler_valid = [&](auto descriptor, const auto& tex)
@@ -306,27 +312,39 @@ void VKGSRender::load_texture_env()
 		const auto& tex = rsx::method_registers.fragment_textures[i];
 		const auto previous_format_class = fs_sampler_state[i]->format_class;
 
-		if (!m_samplers_dirty &&
+		auto& retry = fragment_retries[i];
+		const bool recovering = tex.enabled() && !sampler_state->validate() &&
+			retry.due(recompiler_texture::retry::clock::now());
+
+		if (!recovering && !m_samplers_dirty &&
 			!m_textures_dirty[i] &&
 			check_surface_cache_sampler_valid(sampler_state, tex))
 		{
 			continue;
 		}
 
-		const bool is_sampler_dirty = m_textures_dirty[i];
+		const bool is_sampler_dirty = recovering || m_textures_dirty[i];
 		m_textures_dirty[i] = false;
 
 		if (!tex.enabled())
 		{
 			*sampler_state = {};
+			retry.clear();
 			continue;
 		}
 
 		*sampler_state = m_texture_cache.upload_texture(*m_current_command_buffer, tex, m_rtts);
 		if (!sampler_state->validate())
 		{
+			retry.failed(recompiler_texture::retry::clock::now());
+			if (!recovering && retry_messages++ < 24)
+				rsx_log.notice("RECOMPILER_TEXTURE_RETRY: unavailable slot=%u offset=0x%x %ux%u mips=%u",
+					i, tex.offset(), tex.width(), tex.height(), tex.get_exact_mipmap_count());
 			continue;
 		}
+		retry.clear();
+		if (recovering && retry_messages++ < 24)
+			rsx_log.notice("RECOMPILER_TEXTURE_RETRY: recovered slot=%u offset=0x%x", i, tex.offset());
 
 		if (sampler_state->is_cyclic_reference)
 		{
@@ -1132,6 +1150,11 @@ void VKGSRender::emit_geometry(u32 sub_index)
 	// Bind both pipe and descriptors in one go
 	// FIXME: We only need to rebind the pipeline when reload state is set. Flags?
 	m_program->bind(*m_current_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS);
+	if (vk::recompiler_dynamic::draw_commands.device == static_cast<VkDevice>(*m_device) &&
+		m_shader_interpreter.is_interpreter(m_program))
+	{
+		vk::recompiler_dynamic::apply(*m_current_command_buffer, m_pipeline_properties);
+	}
 
 	if (reload_state)
 	{

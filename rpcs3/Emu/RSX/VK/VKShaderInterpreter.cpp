@@ -12,12 +12,18 @@
 #include "Emu/RSX/rsx_methods.h"
 #include "Emu/localized_string.h"
 
+#include "Utilities/Thread.h"
 #include <thread>
+#include <unordered_map>
+#include "recompiler_shader_warmup_native.h"
+#include "recompiler_dynamic_pipeline.h"
 
 namespace vk
 {
 	using enum program_common::interpreter::compiler_option;
 	using enum program_common::interpreter::cached_pipeline_flags;
+	// BLZ (Michele-M-Media PS3-TO-PS5 port): per-title journal of slow interpreter pipelines.
+	static thread_local recompiler_warmup::journal title_warmup;
 
 	class async_pipe_compiler_context
 	{
@@ -25,6 +31,7 @@ namespace vk
 		VkDevice m_device = VK_NULL_HANDLE;
 		VkShaderModule m_vs = VK_NULL_HANDLE;
 		VkShaderModule m_fs = VK_NULL_HANDLE;
+		bool m_fast_compile = false;
 
 		VkPipelineShaderStageCreateInfo m_shader_stages[2];
 		VkPipelineDynamicStateCreateInfo m_dynamic_state_info{};
@@ -52,11 +59,13 @@ namespace vk
 			const vk::pipeline_props& props,
 			VkDevice device,
 			VkShaderModule vs,
-			VkShaderModule fs)
+			VkShaderModule fs,
+			bool fast_compile)
 			: m_properties(props)
 			, m_device(device)
 			, m_vs(vs)
 			, m_fs(fs)
+			, m_fast_compile(fast_compile)
 		{
 		}
 
@@ -75,6 +84,15 @@ namespace vk
 			if (vk::get_current_renderer()->get_depth_bounds_support())
 			{
 				m_dynamic_state_descriptors.push_back(VK_DYNAMIC_STATE_DEPTH_BOUNDS);
+			}
+
+			if (recompiler_dynamic::draw_commands.device == m_device &&
+				recompiler_dynamic::draw_commands && recompiler_dynamic::eligible(m_properties))
+			{
+				m_dynamic_state_descriptors.insert(m_dynamic_state_descriptors.end(),
+					std::begin(recompiler_dynamic::states),
+					m_properties.state.cs.attachmentCount ? std::end(recompiler_dynamic::states) :
+						std::begin(recompiler_dynamic::states) + recompiler_dynamic::depth_only_state_count);
 			}
 
 			m_dynamic_state_info.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
@@ -102,6 +120,10 @@ namespace vk
 
 			VkGraphicsPipelineCreateInfo info = {};
 			info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+			info.flags = recompiler_feedback::flags(m_properties.renderpass_key, m_properties.state.cs.attachmentCount,
+				vk::get_current_renderer()->get_framebuffer_loops_support());
+			if (m_fast_compile)
+				info.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
 			info.pVertexInputState = &m_vi;
 			info.pInputAssemblyState = &m_properties.state.ia;
 			info.pRasterizationState = &m_properties.state.rs;
@@ -469,12 +491,14 @@ namespace vk
 		m_fs_shader_cache.clear();
 	}
 
-	std::shared_ptr<glsl::program> shader_interpreter::link(const vk::pipeline_props& properties, u64 compiler_opt, bool async, async_build_fn_callback async_callback)
+	std::shared_ptr<glsl::program> shader_interpreter::link(const vk::pipeline_props& properties, u64 compiler_opt, bool async, async_build_fn_callback async_callback, bool fast_compile)
 	{
+		const auto link_start = std::chrono::steady_clock::now();
 		auto vs = build_vs(compiler_opt);
 		auto fs = build_fs(compiler_opt);
+		const auto modules_ready = std::chrono::steady_clock::now();
 
-		async_pipe_compiler_context context{ properties, m_device, vs->shader.get_handle(), fs->shader.get_handle() };
+		async_pipe_compiler_context context{ properties, m_device, vs->shader.get_handle(), fs->shader.get_handle(), fast_compile };
 		auto create_graphics_info_fn = [=]() mutable
 		{
 			return context.compile();
@@ -518,6 +542,15 @@ namespace vk
 			vs->uniforms,
 			fs->uniforms);
 
+		if (fast_compile)
+		{
+			const auto end = std::chrono::steady_clock::now();
+			const auto module_us = std::chrono::duration_cast<std::chrono::microseconds>(modules_ready - link_start).count();
+			const auto pipeline_us = std::chrono::duration_cast<std::chrono::microseconds>(end - modules_ready).count();
+			if (module_us + pipeline_us >= 8'000)
+				rsx_log.notice("RECOMPILER_SHADER_FAST_LINK: modules_us=%lld pipeline_us=%lld flags=0x%llx renderpass=0x%llx",
+					static_cast<s64>(module_us), static_cast<s64>(pipeline_us), compiler_opt, properties.renderpass_key);
+		}
 		return program;
 	}
 
@@ -538,13 +571,16 @@ namespace vk
 	}
 
 	glsl::program* shader_interpreter::get(
-		const vk::pipeline_props& properties,
+		const vk::pipeline_props& actual_properties,
 		const program_hash_util::fragment_program_utils::fragment_program_metadata& fp_metadata,
 		const program_hash_util::vertex_program_utils::vertex_program_metadata& vp_metadata,
 		u32 vp_ctrl,
 		u32 fp_ctrl)
 	{
-		pipeline_key key;
+		const bool dynamic_pipeline = recompiler_dynamic::draw_commands.device == m_device &&
+			static_cast<bool>(recompiler_dynamic::draw_commands);
+		const auto properties = recompiler_dynamic::canonical(actual_properties, dynamic_pipeline);
+		pipeline_key key{};
 		key.compiler_opt = 0;
 		key.properties = properties;
 
@@ -605,6 +641,7 @@ namespace vk
 			if (found != m_program_cache.end()) [[likely]]
 			{
 				m_current_interpreter = found->second.program;
+				title_warmup.log_hit(key.compiler_opt, properties);
 
 				if ((found->second.flags & (CACHED_PIPE_UNOPTIMIZED | CACHED_PIPE_RECOMPILING)) == CACHED_PIPE_UNOPTIMIZED)
 				{
@@ -618,11 +655,23 @@ namespace vk
 
 		const auto start = std::chrono::steady_clock::now();
 
-		m_current_interpreter = link(properties, key.compiler_opt);
+		// The optimized guest shader is already queued by the renderer.
+		// On a miss, prioritize latency for this temporary interpreter draw.
+		const bool fast_compile = g_cfg.video.shadermode == shader_mode::async_with_interpreter && !getenv("BLZ_NO_FAST_INTERPRETER");
+		m_current_interpreter = link(properties, key.compiler_opt, false, {}, fast_compile);
 
 		const auto end = std::chrono::steady_clock::now();
 
 		auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+		const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+		if (elapsed_us >= 8'000)
+		{
+			rsx_log.notice("RECOMPILER_SHADER_WAIT: path=interpreter us=%lld flags=0x%llx renderpass=0x%llx",
+				static_cast<s64>(elapsed_us), key.compiler_opt, properties.renderpass_key);
+		}
+
+		if (m_current_interpreter)
+			title_warmup.learn(key.compiler_opt, actual_properties, static_cast<s64>(elapsed_us), *vk::get_current_renderer());
 		if (duration > std::chrono::milliseconds(1000))
 		{
 			rsx_log.error("Cache miss");
@@ -630,7 +679,8 @@ namespace vk
 
 		pipeline_cache_entry_t cache_entry
 		{
-			.flags = 0,
+			// BLZ: a fast (unoptimized) link is replaced by an optimized async link on its next hit.
+			.flags = fast_compile ? static_cast<u32>(CACHED_PIPE_UNOPTIMIZED) : 0u,
 			.program = m_current_interpreter
 		};
 
@@ -713,6 +763,8 @@ namespace vk
 		// Create some basic pipelines that we'll use to seed the base pipeline queue
 		std::vector<vk::pipeline_props> pipe_properties;
 		auto pdev = vk::get_current_renderer();
+		const bool dynamic_pipeline = recompiler_dynamic::draw_commands.device == m_device &&
+			static_cast<bool>(recompiler_dynamic::draw_commands);
 
 		// Collect format information we intend to use.
 		// All formats to cover as many variants as possible
@@ -777,6 +829,20 @@ namespace vk
 			}
 		}
 
+		// BLZ: with dynamic state, many presets collapse to one pipeline.
+		{
+			std::vector<vk::pipeline_props> unique;
+			for (const auto& props : pipe_properties)
+			{
+				const auto canon = recompiler_dynamic::canonical(props, dynamic_pipeline);
+				if (std::find(unique.begin(), unique.end(), canon) == unique.end())
+					unique.push_back(canon);
+			}
+			rsx_log.notice("RPCS3_SHADER_PRESETS: presets=%u effective=%u dynamic=%u",
+				::size32(pipe_properties), ::size32(unique), static_cast<u32>(dynamic_pipeline));
+			pipe_properties = std::move(unique);
+		}
+
 		const auto variants = program_common::interpreter::get_interpreter_variants();
 		const u32 limit1 = ::size32(variants.base_pipelines) * ::size32(pipe_properties);
 		const u32 limit2 = ::size32(variants.pipelines) * ::size32(pipe_properties);
@@ -809,6 +875,7 @@ namespace vk
 		while (ctr.load() < limit1);
 
 		ctr = 0;
+		{
 		std::lock_guard lock(m_program_cache_lock);
 
 		for (const auto& props : pipe_properties)
@@ -843,7 +910,176 @@ namespace vk
 			}
 		}
 
+		}
+
 		dlg->set_value(1, limit2);
 		dlg->refresh();
+
+		preload_title_warmup(dlg, variants, dynamic_pipeline);
+	}
+
+	// BLZ (Michele-M-Media PS3-TO-PS5 port): precompile the interpreter pipelines this title
+	// was seen to stall on (>= 50 ms) in earlier runs; journal in the title's PPU cache folder.
+	void shader_interpreter::preload_title_warmup(rsx::shader_loading_dialog* dlg,
+		const program_common::interpreter::interpreter_variants_t& variants, bool dynamic_pipeline)
+	{
+		auto pdev = vk::get_current_renderer();
+
+		// base option -> exact options that share its pipeline
+		auto aliases = std::make_shared<std::unordered_map<u64, std::vector<u64>>>();
+		for (const auto& [vertex, fragment] : variants.base_pipelines)
+			aliases->try_emplace(vertex | fragment);
+		for (const auto& variant : variants.pipelines)
+		{
+			const u64 exact = variant.vs_opts.shader_opt | variant.fs_opts.shader_opt;
+			const u64 compatible = variant.vs_opts.compatible_shader_opts | variant.fs_opts.compatible_shader_opts;
+			const auto base = aliases->find(compatible);
+			if (base != aliases->end() && !aliases->contains(exact))
+				base->second.push_back(exact);
+		}
+
+		title_warmup.open(*pdev);
+		auto preload = title_warmup.records;
+		unsigned paired = 0;
+		if (pdev->get_framebuffer_loops_support())
+		{
+			const auto known = preload;
+			for (const auto& original : known)
+			{
+				for (const auto attachment : {recompiler_feedback::plane::color, recompiler_feedback::plane::depth})
+				{
+					auto saved = original;
+					const auto key = recompiler_feedback::companion(saved.renderpass, saved.blend.attachmentCount, attachment);
+					if (!key)
+						continue;
+					saved.renderpass = key;
+					if (recompiler_warmup::valid_record(saved, *pdev) &&
+						std::find(preload.begin(), preload.end(), saved) == preload.end())
+					{
+						preload.push_back(saved);
+						++paired;
+					}
+				}
+			}
+		}
+		const u32 total = ::size32(preload);
+		if (!total)
+		{
+			rsx_log.notice("RECOMPILER_SHADER_WARMUP: startup recorded=0 compiled=0");
+			return;
+		}
+		if (!title_warmup.begin_preload())
+			return;
+
+		struct warmup_job
+		{
+			pipeline_key key;
+			bool compatible;
+			std::vector<u64> requested_options;
+		};
+		std::vector<warmup_job> jobs;
+		for (const auto& saved : preload)
+		{
+			const auto properties = recompiler_dynamic::canonical(saved.properties(), dynamic_pipeline);
+			u64 options = saved.options;
+			const bool feedback = recompiler_feedback::flags(properties.renderpass_key, properties.state.cs.attachmentCount,
+				pdev->get_framebuffer_loops_support()) != 0;
+			bool compatible = false;
+			const bool depth_only = properties.state.cs.attachmentCount == 0 &&
+				recompiler_dynamic::eligible(properties);
+			if (feedback || depth_only)
+			{
+				for (const auto& variant : variants.pipelines)
+				{
+					if ((variant.vs_opts.shader_opt | variant.fs_opts.shader_opt) == saved.options)
+					{
+						options = variant.vs_opts.compatible_shader_opts | variant.fs_opts.compatible_shader_opts;
+						compatible = aliases->contains(options);
+						break;
+					}
+				}
+			}
+			const pipeline_key key{options, properties};
+			const auto duplicate = std::find_if(jobs.begin(), jobs.end(), [&](const warmup_job& job)
+			{
+				return job.key == key;
+			});
+			if (duplicate != jobs.end())
+			{
+				duplicate->compatible |= compatible;
+				if (std::find(duplicate->requested_options.begin(), duplicate->requested_options.end(), saved.options) == duplicate->requested_options.end())
+					duplicate->requested_options.push_back(saved.options);
+				continue;
+			}
+			{
+				reader_lock read_lock(m_program_cache_lock);
+				const auto found = m_program_cache.find(key);
+				if (found != m_program_cache.end() && found->second.program && !found->second.flags)
+					continue;
+			}
+			jobs.push_back({key, compatible, {saved.options}});
+		}
+
+		const u32 jobs_total = ::size32(jobs);
+		dlg->set_limit(1, jobs_total ? jobs_total : 1);
+		dlg->set_value(1, 0);
+		dlg->refresh();
+		auto prepared = std::make_shared<atomic_t<u32>>(0);
+		const auto wait_for_warmup = [&](u32 target)
+		{
+			while (prepared->load() < target && !Emu.IsStopped() && thread_ctrl::state() != thread_state::aborting)
+			{
+				std::this_thread::sleep_for(16ms);
+				dlg->set_value(1, prepared->load());
+				dlg->refresh();
+			}
+			return !Emu.IsStopped() && thread_ctrl::state() != thread_state::aborting;
+		};
+		constexpr u32 warmup_pending_limit = 8;
+		u32 warmup_queued = 0;
+		for (const auto& job : jobs)
+		{
+			if (!wait_for_warmup(warmup_queued >= warmup_pending_limit ? warmup_queued - warmup_pending_limit + 1 : 0))
+				break;
+			const auto key = job.key;
+			link(key.properties, key.compiler_opt, true,
+				[this, key, compatible = job.compatible, aliases, prepared](std::shared_ptr<glsl::program>& program)
+			{
+				// Runs under m_program_cache_lock (link's callback).
+				if (compatible && program)
+				{
+					if (const auto it = aliases->find(key.compiler_opt); it != aliases->end())
+					{
+						for (const u64 exact : it->second)
+						{
+							m_program_cache.try_emplace(pipeline_key{exact, key.properties},
+								pipeline_cache_entry_t{.flags = CACHED_PIPE_UNOPTIMIZED, .program = program});
+						}
+					}
+				}
+				++(*prepared);
+			});
+			++warmup_queued;
+		}
+		const bool finished = wait_for_warmup(warmup_queued);
+		title_warmup.end_preload();
+		if (!finished)
+			return;
+		dlg->set_value(1, jobs_total);
+		{
+			reader_lock read_lock(m_program_cache_lock);
+			for (const auto& job : jobs)
+			{
+				for (const u64 option : job.requested_options)
+				{
+					const auto found = m_program_cache.find(pipeline_key{option, job.key.properties});
+					if (found != m_program_cache.end() && found->second.program)
+						title_warmup.warmed.push_back(recompiler_warmup::from_pipeline(option, job.key.properties));
+				}
+			}
+		}
+		rsx_log.notice("RECOMPILER_SHADER_FEEDBACK_PRELOAD: paired=%u prepared=%u",
+			paired, ::size32(title_warmup.warmed));
+		rsx_log.notice("RECOMPILER_SHADER_WARMUP: startup recorded=%u jobs=%u compiled=%u", total, jobs_total, prepared->load());
 	}
 };

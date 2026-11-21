@@ -2,6 +2,7 @@
 #include "Emu/RSX/VK/VKProgramPipeline.h"
 #include "Emu/RSX/Program/ProgramStateCache.h"
 #include "Emu/RSX/VK/VKPipelineCompiler.h"
+#include "Emu/RSX/Program/ShaderInterpreter.h"
 #include "vkutils/descriptors.h"
 #include <unordered_map>
 
@@ -77,7 +78,7 @@ namespace vk
 
 		std::shared_ptr<VKVertexProgram> build_vs(u64 compiler_opt);
 		std::shared_ptr<VKFragmentProgram> build_fs(u64 compiler_opt);
-		std::shared_ptr<glsl::program> link(const vk::pipeline_props& properties, u64 compiler_opt, bool async = false, async_build_fn_callback async_callback = {});
+		std::shared_ptr<glsl::program> link(const vk::pipeline_props& properties, u64 compiler_opt, bool async = false, async_build_fn_callback async_callback = {}, bool fast_compile = false);
 
 		u32 init(std::shared_ptr<VKVertexProgram>& vk_prog, u64 compiler_opt) const;
 		u32 init(std::shared_ptr<VKFragmentProgram>& vk_prog, u64 compiler_opt) const;
@@ -89,6 +90,7 @@ namespace vk
 		void destroy();
 
 		void preload(rsx::shader_loading_dialog* dlg);
+		void preload_title_warmup(rsx::shader_loading_dialog* dlg, const program_common::interpreter::interpreter_variants_t& variants, bool dynamic_pipeline);
 
 		glsl::program* get(
 			const vk::pipeline_props& properties,

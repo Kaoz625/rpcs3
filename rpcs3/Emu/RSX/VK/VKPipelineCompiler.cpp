@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "VKPipelineCompiler.h"
+#include "recompiler_feedback_pass.h"
 #include "VKRenderPass.h"
 #include "vkutils/device.h"
 #include "Utilities/Thread.h"
@@ -176,6 +177,8 @@ namespace vk
 
 		VkGraphicsPipelineCreateInfo info = {};
 		info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+		info.flags = recompiler_feedback::flags(create_info.renderpass_key, create_info.state.cs.attachmentCount,
+			m_device->get_framebuffer_loops_support());
 		info.pVertexInputState = &vi;
 		info.pInputAssemblyState = &create_info.state.ia;
 		info.pRasterizationState = &rs;
